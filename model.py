@@ -1,153 +1,151 @@
-from ast import Param
 import torch
 import torch.nn as nn
-import config_historique as config
-import torch.nn.functional as F
-from convnext import convnext_small
-import torch.nn.init as init
+from transformers import T5Tokenizer, T5EncoderModel
+from torchvision import transforms
+import json
+import cv2
+import os
+from convnext import ConvNeXt  
+from parsing import extract_json 
+from datetime import datetime
 
 
-class MedicalModel(nn.Module):
-    def __init__(self, width_mult=1.):
-        
-        super(MedicalModel, self).__init__()
-        
-        model=convnext_small(True,True,drop_path_rate=0.9)
+class ClinicalFeaturesExtractor(nn.Module):
+    def __init__(self):
+        super(ClinicalFeaturesExtractor, self).__init__()
+        self.encoder = T5EncoderModel.from_pretrained('google/flan-t5-small')
+        self.feature_dim = 512
 
-        self.net=model
-        self.firstlinearlayer=nn.Linear(config.convnext_config_shape,config.historical_info_shape)
-        
-        self.frottis_embedding=torch.nn.Embedding(len(config.frottis_value_to_key), config.embed_dim, padding_idx=0)
-        
-        self.biopsie_embedding=torch.nn.Embedding(len(config.Biopsie_Erad_value_to_key), config.embed_dim, padding_idx=0)
-        
-        self.erad_embedding=torch.nn.Embedding(len(config.Biopsie_Erad_value_to_key), config.embed_dim, padding_idx=0)
-
-        self.HPV_embedding=torch.nn.Embedding(len(config.HPV_value_to_key), config.embed_dim, padding_idx=0)
-                
-        self.HPV_type_linear=nn.Linear(len(config.HPV_type_value_to_key),2*config.embed_dim)
-        
-        self.Vaccin_embedding=torch.nn.Embedding(2, config.embed_dim)
-        
-        self.classfier=Classifier(config.historical_info_shape*2,len(config.Diagno),intermediate_drop=0.5,final_drop=0.5)
-        
-        self.classfier_visual=Classifier(config.historical_info_shape,len(config.Diagno),intermediate_drop=0.5,final_drop=0.5)
-        self.classfier_historical=Classifier(config.historical_info_shape,len(config.Diagno),intermediate_drop=0.5,final_drop=0.5)
-        
-        self.classifier_histo=Classifier_Histo(config.embed_dim*27+17,config.historical_info_shape,intermediate_drop=0.5)
-        
-        self.layer_norm_0=torch.nn.LayerNorm(config.historical_info_shape)
-        self.layer_norm_1=torch.nn.LayerNorm(config.historical_info_shape)
-        
-        for m in self.modules():
-            try:
-                init.xavier_uniform(m.weight)
-                if m.bias is not None:
-                    m.bias.data.zero_()
-            except:
-                pass
-        
-        self.dropout_embeddings=  nn.Dropout(0.5)      
-        self.dropout_layer=nn.Dropout(0.5)
-        self.dropout_layer_visual=nn.Dropout(0.5)
-
-        
-        
-        
+    def forward(self, input_ids, attention_mask):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        clinical_features = outputs.last_hidden_state[:, 0, :]
+        return clinical_features
 
 class Classifier(nn.Module):
-        def __init__(self,in_dimension,out_dimension,inter_dim=4096,input_drop=0,intermediate_drop=0.5,final_drop=0.5):
-            
-            super(Classifier, self).__init__()
+    def __init__(self, input_dim, num_classes):
+        super(Classifier, self).__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim , input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, num_classes)
+        )
 
-            self.layer_0 = nn.Linear(in_dimension, inter_dim)
-            self.layer_1 = nn.Linear(inter_dim , inter_dim)
-            self.layer_2 = nn.Linear(inter_dim , out_dimension)
+    def forward(self, x):
+        return self.classifier(x)
+
+class MultimodalModel(nn.Module):
+    def __init__(self, num_classes):
+        super(MultimodalModel, self).__init__()
+        self.visual_backbone = ConvNeXt(in_chans=3, num_classes=1536)  # Adapt based on convnext.py
+        self.clinical_extractor = ClinicalFeaturesExtractor()
+        self.visual_classifier = Classifier(self.visual_backbone.num_classes, num_classes)
+        self.clinical_classifier = Classifier(self.clinical_extractor.feature_dim, num_classes)
+        self.combined_classifier = Classifier(
+            self.visual_backbone.num_classes + self.clinical_extractor.feature_dim, num_classes
+        )
+
+    def forward(self, images=None, input_ids=None, attention_mask=None):
+        outputs = {}
+        visual_features = self.visual_backbone(images) if images is not None else None
+        clinical_features = self.clinical_extractor(input_ids, attention_mask) if input_ids is not None else None
+
+        if visual_features is not None:
+            outputs['visual_logits'] = self.visual_classifier(visual_features)
+        if clinical_features is not None:
+            outputs['clinical_logits'] = self.clinical_classifier(clinical_features)
+        if visual_features is not None and clinical_features is not None:
+            combined_features = torch.cat([visual_features, clinical_features], dim=1)
+            outputs['combined_logits'] = self.combined_classifier(combined_features)
+
+        return outputs
 
 
-            self.input_dropout_layer = nn.Dropout(p=input_drop)
-            self.intermediate_dropout_layer = nn.Dropout(p=intermediate_drop)
-            self.final_dropout_layer = nn.Dropout(p=final_drop)
+# Helper function to format clinical history
+def format_clinical_text(clinical_data):
+    base_date_str = clinical_data.get('date_colposcopie')
+    base_date = datetime.strptime(base_date_str, "%Y-%m-%d") if base_date_str else None
+    
+    clinical_text = []
+    for key, value in clinical_data.items():
+        if key == 'date_colposcopie' or not value:
+            continue
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                date = datetime.strptime(sub_key, "%Y-%m-%d")
+                days_difference = (base_date - date).days if base_date else "N/A"
+                clinical_text.append(f"{sub_value} : {days_difference}")
+        else:
+            days_difference = 0  # Default to 0 if no specific date provided
+            clinical_text.append(f"{value} : {days_difference}")
+    
+    return " ".join(clinical_text)
 
 
-        def forward(self, input):
-            """
-            This function outputs the predicted character probabilities of the current decoding step
-            Parameters
-            ----------
-            context_vector : Pytorch Tensor
-                the weighted sum of the feature map vectors using the attention weights
+def initialize_model(model_path, num_classes=5):
+    model = MultimodalModel(num_classes=num_classes)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    return model
 
 
-            Returns
-            -------
-            logits : Pytorch Tensor
-                the current decoding step classification logits batch
+def inference(docx_file_path, model, output_json_path, output_images_dir):
+    clinical_data, image_paths = extract_json(docx_file_path, output_json_path, output_images_dir)
 
+    clinical_text = format_clinical_text(clinical_data)
 
-            """
-            input=self.input_dropout_layer(input)
-            
-            input=F.relu(self.layer_0(input))
-            
-            input = self.intermediate_dropout_layer(input)
+    tokenizer = T5Tokenizer.from_pretrained('google/flan-t5-small')
+    encoding = tokenizer(
+        clinical_text, padding='max_length', truncation=True, max_length=2048, return_tensors='pt'
+    )
 
-            input =  F.relu(self.layer_1(input ) )
-            
-            input = self.final_dropout_layer(input)
-             
-            logits =  self.layer_2(input )
+    transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    preprocessed_images = [transform(cv2.imread(image_path)) for image_path in image_paths]
+    preprocessed_images = torch.stack(preprocessed_images)
 
-            return logits
+    with torch.no_grad():
+        outputs = model(
+            images=preprocessed_images,
+            input_ids=encoding['input_ids'],
+            attention_mask=encoding['attention_mask']
+        )
         
-class Classifier_Histo(nn.Module):
-        def __init__(self,in_dimension,out_dimension,inter_dim=4096,input_drop=0,intermediate_drop=0.5,final_drop=0):
-            
-            super(Classifier_Histo, self).__init__()
+    predictions = {}
+    if 'visual_logits' in outputs:
+        _, predicted_label_visual = outputs['visual_logits'].max(1)
+        predictions['visual'] = predicted_label_visual.item()
+    if 'clinical_logits' in outputs:
+        _, predicted_label_clinical = outputs['clinical_logits'].max(1)
+        predictions['clinical'] = predicted_label_clinical.item()
+    if 'combined_logits' in outputs:
+        _, predicted_label_combined = outputs['combined_logits'].max(1)
+        predictions['combined'] = predicted_label_combined.item()
 
-            self.layer_0 = nn.Linear(in_dimension, inter_dim)
-            self.layer_1 = nn.Linear(inter_dim , inter_dim)
-            self.layer_2 = nn.Linear(inter_dim , inter_dim)
-            self.layer_3 = nn.Linear(inter_dim , inter_dim)
-            self.layer_4 = nn.Linear(inter_dim , out_dimension)
+    prediction_output = {
+        "Visual Only Prediction": predictions.get('visual', 'N/A'),
+        "Clinical Only Prediction": predictions.get('clinical', 'N/A'),
+        "Combined Prediction": predictions.get('combined', 'N/A')
+    }
+    
+    with open(output_json_path.replace(".json", "_predictions.json"), 'w') as f:
+        json.dump(prediction_output, f)
 
-
-            self.input_dropout_layer = nn.Dropout(p=input_drop)
-            self.intermediate_dropout_layer = nn.Dropout(p=intermediate_drop)
-            self.final_dropout_layer = nn.Dropout(p=final_drop)
-
-            
-
-        def forward(self, input):
-            """
-            This function outputs the predicted character probabilities of the current decoding step
-            Parameters
-            ----------
-            context_vector : Pytorch Tensor
-                the weighted sum of the feature map vectors using the attention weights
+    return prediction_output, preprocessed_images
 
 
-            Returns
-            -------
-            logits : Pytorch Tensor
-                the current decoding step classification logits batch
+# Example Usage
+model_path = 'model_checkpoint.pth'
+model = initialize_model(model_path)  # Load the model once
 
-
-            """
-
-            input=self.input_dropout_layer(input)
-            
-            input_1=self.intermediate_dropout_layer(F.leaky_relu(self.layer_0(input)))
-            
-            input_2 =  self.intermediate_dropout_layer(F.leaky_relu(self.layer_1(input_1)))
-            
-            input_3 =  self.intermediate_dropout_layer(F.leaky_relu(self.layer_2(input_2)))
-            
-            input_4 =  self.intermediate_dropout_layer(F.leaky_relu(self.layer_3(input_3)))
-            
-            input_5 =  F.leaky_relu(self.layer_4(input_4))
-                        
-
-            return input_5
-        
-        
+# Inference on a specific document
+docx_file_path = 'data.docx'
+output_json_path = 'output/data.json'
+output_images_dir = 'output/images'
+predictions, processed_images = inference(docx_file_path, model, output_json_path, output_images_dir)
+print(predictions)
